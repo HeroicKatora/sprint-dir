@@ -1,15 +1,19 @@
 use bytemuck::{Pod, Zeroable};
+use core::convert::TryFrom;
 use core::{mem, ptr};
 use index_ext::Int;
 
+/// A buffer for collecting results of `getdents`.
 pub struct DirentBuf {
     inner: Box<[u8]>,
 }
 
+/// A reference to a single entry.
 pub struct Entry<'buf> {
     inner: &'buf Dirent64,
 }
 
+/// A consistency error of the result buffer.
 pub enum DirentErr {
     TooShort,
     InvalidOffset,
@@ -18,6 +22,8 @@ pub enum DirentErr {
 
 impl DirentBuf {
     pub fn with_size(length: usize) -> Self {
+        libc::c_uint::try_from(length).expect("Buffer size invalid for `getdent` syscall.");
+
         DirentBuf {
             inner: vec![0; length].into(),
         }
@@ -45,7 +51,7 @@ struct DirentTarget {
 struct Dirent64 {
     /// The inode associated with the entry.
     d_ino: libc::c_ulong,
-    /// The offset to the next entry.
+    /// The offset to the next entry, for seeking.
     d_off: libc::c_ulong,
     /// The length of the buffer, _after_ the syscall succeeded.
     d_reclen: libc::c_ushort,
@@ -78,9 +84,8 @@ unsafe impl Zeroable for dirent64 {}
 unsafe impl Pod for dirent64 {}
 
 fn sys_getdents64(fd: libc::c_uint, into: &mut DirentTarget) -> libc::c_int {
-    use core::convert::TryFrom;
-    // FIXME: handle sizes.
-    let length: libc::c_uint = libc::c_uint::try_from(into.buf.len()).unwrap();
+    let length: libc::c_uint = libc::c_uint::try_from(into.buf.len())
+        .expect("Invalid buffer length should have been checked");
     unsafe {
         libc::syscall(
             libc::SYS_getdents64,
@@ -97,20 +102,16 @@ impl Dirent64 {
             .get(..mem::size_of::<dirent64>())
             .ok_or(DirentErr::TooShort)?;
         let spec_head = bytemuck::from_bytes(speculate);
-        let dirent64 {
-            d_off, d_reclen, ..
-        } = *spec_head;
+        let dirent64 { d_reclen, .. } = *spec_head;
 
-        let head = buf.get_int(..d_off).ok_or(DirentErr::InvalidOffset)?;
-        let tail = buf.get_int(d_off..).unwrap();
-
-        let spec_entry = head.get_int(..d_reclen).ok_or(DirentErr::InvalidLength)?;
+        let spec_entry = buf.get_int(..d_reclen).ok_or(DirentErr::InvalidLength)?;
+        let tail = buf.get_int(d_reclen..).unwrap();
 
         // Do a final consistency check.
         let _entry_head = spec_entry
             .get(..mem::size_of::<dirent64>())
             .ok_or(DirentErr::InvalidOffset)?;
-        let entry_name = head.get(mem::size_of::<dirent64>()..).unwrap();
+        let entry_name = spec_entry.get(mem::size_of::<dirent64>()..).unwrap();
 
         // Did all consistency checks necessary! (The null-byte check can be done later, we'll
         // check for UTF-8 as well so who cares).
@@ -129,9 +130,9 @@ impl Dirent64 {
 
 /// Not a transparent wrapper, as we have an alignment invariant.
 impl DirentTarget {
-    fn new(buffer: &mut [u8]) -> Option<&mut Self> {
-        // TODO: we'll see if we need alignment invariants.
-        Some(unsafe { &mut *(buffer as *mut [u8] as *mut DirentTarget) })
+    fn new(buffer: &mut [u8]) -> &mut Self {
+        //SAFETY: No extra safety invariants, just a marker type.
+        unsafe { &mut *(buffer as *mut [u8] as *mut DirentTarget) }
     }
 }
 
