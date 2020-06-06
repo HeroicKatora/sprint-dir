@@ -1,0 +1,12 @@
+[package]
+name = "sprint-dir"
+description = "Walk directory trees, really really fast"
+version = "0.1.0"
+authors = ["Andreas Molzer <andreas.molzer@gmx.de>"]
+edition = "2018"
+
+[dependencies]
+bytemuck = "1.2"
+# We depend on libc for making syscalls. This is not optimal.
+libc = "0.2.71"
+index-ext = "0.0.1"
