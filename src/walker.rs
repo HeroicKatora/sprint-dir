@@ -1,20 +1,25 @@
 use crate::getdent::DirentBuf;
 
 use std::io;
-use std::ffi::{CStr, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::os::unix::ffi::OsStrExt;
 
 use super::UnixFileType as FileTypeInner;
 use super::getdent::{DirentErr, Entry, More};
 
 /// Configure walking over all files in a directory tree.
 pub struct WalkDir {
-    init: Open,
+    /// The user supplied configuration.
+    config: Configuration,
+    path: PathBuf,
 }
 
 /// The main iterator.
 pub struct IntoIter {
+    /// The user supplied configuration.
+    config: Configuration,
     /// The current 'finger' within the tree of directories.
     stack: Vec<WorkItem>,
     open_budget: usize,
@@ -28,9 +33,19 @@ pub struct DirEntry {
     /// The file type reported by the call to `getdent`.
     file_type: FileType,
     /// The file name of this entry.
-    file_name: OsString,
-    /// The parent directory of the entry.
-    parent: Arc<Node>,
+    file_name: EntryPath,
+}
+
+#[derive(Debug, Clone)]
+enum EntryPath {
+    /// We have already allocate the whole path in its own buffer.
+    Full(PathBuf),
+    /// The path is given as the filename alone.
+    Name {
+        name: OsString,
+        /// The parent directory of the entry.
+        parent: Arc<Node>,
+    },
 }
 
 #[derive(Debug)]
@@ -47,12 +62,22 @@ pub struct FileType {
     inner: Option<FileTypeInner>,
 }
 
+#[derive(Copy, Clone)]
+struct Configuration {
+    min_depth: usize,
+    max_depth: usize,
+    max_open: usize,
+    follow_links: bool,
+    contents_first: bool,
+    same_file_system: bool,
+}
+
 /// Completed directory nodes that are parents of still open nodes or active entries.
 #[derive(Debug)]
 struct Node {
     depth: usize,
     /// The parent of this node.
-    as_parent: Option<Arc<Node>>,
+    parent: Option<Arc<Node>>,
     /// The file name of this file itself.
     filename: OsString,
 }
@@ -67,30 +92,28 @@ enum WorkItem {
 /// Directories with a file descriptor.
 struct Open {
     /// The open file descriptor.
-    fd: libc::c_int,
+    fd: DirFd,
     /// The buffer for reading entries of this directory.
     buffer: DirentBuf,
     /// The directory depth of this descriptor.
     depth: usize,
     /// The parent representation of this node.
     /// Not to be confused with the potentially still open parent directory.
-    parent: Arc<Node>,
+    as_parent: Arc<Node>,
 }
 
 /// Describes a directory that had to be closed, and its entries read to memory.
 struct Closed {
-    /// The complete path up to here.
-    /// Since the file descriptor was closed we can't use `openat` but need to reconstruct the full
-    /// path. We might want to track statistics on this since it really is annoying.
-    path: PathBuf,
     /// The directory depth of the directory.
     depth: usize,
     /// The children.
     children: Vec<Backlog>,
     /// The parent representation of this node.
     /// The parent directory is also surely closed but children might not be.
-    parent: Arc<Node>,
+    as_parent: Option<Arc<Node>>,
 }
+
+struct DirFd(libc::c_int);
 
 /// Describes an item of a closed directory.
 ///
@@ -101,7 +124,10 @@ struct Closed {
 ///
 /// TODO: what if we use a dequeue to actually allocate these consecutively in memory?
 struct Backlog {
-    file_name: OsString,
+    /// The complete path up to here.
+    /// Since the file descriptor was closed we can't use `openat` but need to reconstruct the full
+    /// path. We might want to track statistics on this since it really is annoying.
+    file_path: PathBuf,
     file_type: Option<FileTypeInner>,
 }
 
@@ -109,24 +135,30 @@ struct Backlog {
 
 impl WalkDir {
     pub fn new(path: impl AsRef<Path>) -> Self {
-        todo!()
+        WalkDir {
+            config: Configuration::default(),
+            path: path.as_ref().to_owned(),
+        }
     }
 
-    pub fn min_depth(self, n: usize) -> Self {
-        todo!()
+    pub fn min_depth(mut self, n: usize) -> Self {
+        self.config.min_depth = n;
+        self
     }
 
-    pub fn max_depth(self, n: usize) -> Self {
-        todo!()
+    pub fn max_depth(mut self, n: usize) -> Self {
+        self.config.max_depth = n;
+        self
     }
 
-    pub fn max_open(self, n: usize) -> Self {
-        assert!(n > 0, "");
-        todo!()
+    pub fn max_open(mut self, n: usize) -> Self {
+        self.config.max_open = n;
+        self
     }
 
-    pub fn follow_links(self, yes: bool) -> Self {
-        todo!()
+    pub fn follow_links(mut self, yes: bool) -> Self {
+        self.config.follow_links = yes;
+        self
     }
 
     pub fn sort_by<F>(self, cmp: F) -> Self where
@@ -135,18 +167,50 @@ impl WalkDir {
         todo!()
     }
 
-    pub fn contents_first(self, yes: bool) -> Self {
-        todo!()
+    pub fn contents_first(mut self, yes: bool) -> Self {
+        self.config.contents_first = yes;
+        self
     }
 
-    pub fn same_file_system(self, yes: bool) -> Self {
-        todo!()
+    pub fn same_file_system(mut self, yes: bool) -> Self {
+        self.config.same_file_system = yes;
+        self
     }
 
-    pub fn into_iter(self) -> IntoIter {
+    pub fn build(mut self) -> IntoIter {
+        let first_item = self.initial_closed();
+
         IntoIter {
-            stack: vec![WorkItem::Open(self.init)],
+            config: self.config,
+            stack: vec![WorkItem::Closed(first_item)],
             open_budget: 128,
+        }
+    }
+
+    fn initial_closed(&mut self) -> Closed {
+        let backlog = Backlog {
+            file_path: core::mem::take(&mut self.path),
+            // We do not _know_ this file type yet, recover and check on iteration.
+            file_type: None,
+        };
+
+        Closed {
+            depth: 0,
+            children: vec![backlog],
+            as_parent: None,
+        }
+    }
+}
+
+impl Default for Configuration {
+    fn default() -> Self {
+        Configuration {
+            min_depth: 0,
+            max_depth: usize::MAX,
+            max_open: 10,
+            follow_links: false,
+            contents_first: false,
+            same_file_system: false,
         }
     }
 }
@@ -225,55 +289,108 @@ impl DirEntry {
 
 impl Open {
     /// Get the next item from this directory.
-    fn pop(&mut self) -> Option<Backlog> {
-        self.buffer.drain().next().map(Self::from_dirent)
+    fn pop(&mut self) -> Option<Entry<'_>> {
+        self.buffer.drain().next().map(Self::okay)
     }
 
     fn ready_entry(&mut self) -> Option<DirEntry> {
-        let backlog = self.pop()?;
+        let entry = self.pop()?;
         Some(DirEntry {
-            file_name: backlog.file_name,
-            file_type: FileType { inner: backlog.file_type },
-            parent: self.parent.clone(),
+            file_name: EntryPath::Name {
+                name: entry.path().to_owned(),
+                parent: self.as_parent.clone(),
+            },
+            file_type: FileType {
+                inner: entry.file_type(),
+            },
         })
     }
 
     /// Forcibly close this directory entry.
     /// Returns None if its already finished and Some with the remaining backlog items otherwise.
-    fn close(&mut self) -> io::Result<Option<Closed>> {
+    fn close(mut self) -> io::Result<Option<Closed>> {
         let mut backlog = vec![];
+        let base = self.make_path();
+
         loop {
             let entries = self.buffer
                 .drain()
-                .map(Self::from_dirent);
+                .map(|entry| Self::backlog(&base, entry));
             backlog.extend(entries);
-            match self.buffer.fill_buf(self.fd)? {
+            match self.buffer.fill_buf(self.fd.0)? {
                 More::Blocked => unreachable!("Just drained buffer is blocked"),
                 More::More => {},
                 More::Done => break,
             }
         }
 
-        match unsafe { libc::close(self.fd) } {
-            0 => {},
-            _ => return Err(io::Error::last_os_error()),
-        };
-
         if backlog.is_empty() {
-            return Ok(None)
+            self.fd.close()?;
+            Ok(None)
+        } else {
+            let closed = Closed::from_backlog(&self, backlog);
+            self.fd.close()?;
+            Ok(Some(closed))
         }
-
-        Ok(Some(Closed::from_backlog(self, backlog)))
     }
 
-    fn from_dirent(entry: Result<Entry<'_>, DirentErr>) -> Backlog {
+    /// Reconstruct the complete path buffer.
+    fn make_path(&self) -> PathBuf {
+        self.as_parent.path()
+    }
+
+    /// Filter an entry that we got from the internal buffer.
+    /// Handles kernel errors and setup faults which mustn't occur in regular operation.
+    fn okay(entry: Result<Entry<'_>, DirentErr>) -> Entry<'_> {
         match entry {
-            Ok(entry) => Backlog {
-                file_name: entry.path().to_owned(),
-                file_type: entry.file_type(),
-            },
+            Ok(entry) => entry,
             Err(DirentErr::TooShort) => unreachable!("Inconsistent buffer state"),
             Err(DirentErr::InvalidLength) => unreachable!("You must have hit a kernel bug!"),
+        }
+    }
+
+    fn backlog(base: &Path, entry: Result<Entry<'_>, DirentErr>) -> Backlog {
+        let entry = Self::okay(entry);
+        Backlog {
+            file_path: base.join(entry.path()),
+            file_type: entry.file_type(),
+        }
+    }
+}
+
+impl DirFd {
+    fn open(path: &Path) -> io::Result<Self> {
+        let mut raw_name = path.as_os_str().as_bytes().to_owned();
+        raw_name.push(b'\0');
+        let unix_name = CString::new(raw_name).expect("No interior NULL byte in Path");
+
+        let result = unsafe {
+            libc::open(unix_name.as_c_str().as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
+        };
+
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(DirFd(result))
+    }
+
+    fn openat(&self, path: &CStr) -> io::Result<Self> {
+        let result = unsafe {
+            libc::openat(self.0, path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
+        };
+
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(DirFd(result))
+    }
+
+    fn close(self) -> io::Result<()> {
+        match unsafe { libc::close(self.0) } {
+            0 => Ok(()),
+            _ => Err(io::Error::last_os_error()),
         }
     }
 }
@@ -286,10 +403,22 @@ impl Closed {
     fn ready_entry(&mut self) -> Option<DirEntry> {
         let backlog = self.children.pop()?;
         Some(DirEntry {
-            file_name: backlog.file_name,
+            file_name: EntryPath::Full(backlog.file_path),
             file_type: FileType { inner: backlog.file_type },
-            parent: self.parent.clone(),
         })
+    }
+}
+
+impl Node {
+    /// Allocate a path buffer for the path described.
+    fn path(&self) -> PathBuf {
+        if let Some(parent) = &self.parent {
+            let mut buf = parent.path();
+            buf.push(&self.filename);
+            buf
+        } else {
+            PathBuf::from(&self.filename)
+        }
     }
 }
 
@@ -297,7 +426,7 @@ impl IntoIterator for WalkDir {
     type IntoIter = IntoIter;
     type Item = Result<DirEntry, Error>;
     fn into_iter(self) -> IntoIter {
-        WalkDir::into_iter(self)
+        WalkDir::build(self)
     }
 }
 
@@ -336,17 +465,15 @@ impl Iterator for IntoIter {
 // Private implementation items.
 
 impl Open {
-    /// Open a relative directory.
-    fn open_dir_at(&self, path: &CStr) -> Result<libc::c_int, io::Error> {
-        let result = unsafe {
-            libc::openat(self.fd, path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY)
-        };
+    fn openat(&self, path: &CStr) -> io::Result<Self> {
+        let fd = self.fd.openat(path)?;
 
-        if result == -1 {
-            return Err(io::Error::last_os_error());
-        }
-
-        Ok(result)
+        Ok(Open {
+            fd,
+            buffer: DirentBuf::with_size(1 << 12),
+            depth: self.depth + 1,
+            as_parent: todo!(),
+        })
     }
 }
 
