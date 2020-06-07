@@ -1,9 +1,11 @@
 use crate::getdent::DirentBuf;
 
+use core::mem;
 use std::io;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::ffi::OsStrExt;
 
 use super::UnixFileType as FileTypeInner;
@@ -32,6 +34,8 @@ pub struct IntoIter {
 pub struct DirEntry {
     /// The file type reported by the call to `getdent`.
     file_type: FileType,
+    /// The depth at which this entry was found.
+    depth: usize,
     /// The file name of this entry.
     file_name: EntryPath,
 }
@@ -75,11 +79,10 @@ struct Configuration {
 /// Completed directory nodes that are parents of still open nodes or active entries.
 #[derive(Debug)]
 struct Node {
+    /// The depth at which this node occurs.
     depth: usize,
-    /// The parent of this node.
-    parent: Option<Arc<Node>>,
-    /// The file name of this file itself.
-    filename: OsString,
+    /// The path of this node.
+    path: EntryPath,
 }
 
 enum WorkItem {
@@ -202,6 +205,15 @@ impl WalkDir {
     }
 }
 
+impl Configuration {
+    fn assert_consistent(&self) {
+        assert!(self.min_depth <= self.max_depth);
+        assert!(self.max_open > 0);
+        assert!(!self.follow_links, "Unsupported");
+        assert!(!self.same_file_system , "Unsupported");
+    }
+}
+
 impl Default for Configuration {
     fn default() -> Self {
         Configuration {
@@ -243,6 +255,10 @@ impl FileType {
     pub fn is_symlink(&self) -> bool {
         self.inner == Some(FileTypeInner::SymbolicLink)
     }
+
+    fn set(&mut self, inner: FileTypeInner) {
+        self.inner = Some(inner);
+    }
 }
 
 impl DirEntry {
@@ -250,32 +266,35 @@ impl DirEntry {
 
     /// Inspect the path of this entry.
     pub fn path(&self) -> &Path {
-        todo!()
+        Path::new(self.file_name())
     }
 
     pub fn path_is_symlink(&self) -> bool {
-        todo!()
+        self.file_type.is_symlink()
     }
 
     /// Read the full meta data.
     pub fn metadata(&self) -> io::Result<std::fs::Metadata> {
-        todo!()
+        std::fs::metadata(self.file_name.path())
     }
 
     /// Convert the entry into a path
     ///
     /// Potentially more efficient than `as_path().to_owned()`.
     pub fn into_path(self) -> PathBuf {
-        todo!()
+        self.file_name.path()
     }
 
     pub fn file_type(&self) -> FileType {
-        todo!()
+        self.file_type
     }
 
     /// Return the filename of this entry.
     pub fn file_name(&self) -> &OsStr {
-        todo!()
+        match &self.file_name {
+            EntryPath::Full(buf) => buf.file_name().unwrap(),
+            EntryPath::Name { name, .. } => name,
+        }
     }
 
     /// The depth at which this entry is in the directory tree.
@@ -283,27 +302,58 @@ impl DirEntry {
     /// When iterating items in depth-first order and following symbolic links then this is not
     /// necessarily the smallest depth at which it might appear.
     pub fn depth(&self) -> usize {
-        todo!()
+        self.depth
     }
 }
 
 impl Open {
+    fn openat_os(&self, path: &OsStr) -> io::Result<Self> {
+        let bytes = path.as_bytes().to_owned();
+        let cstr = CString::new(bytes).unwrap();
+        self.openat(&cstr)
+    }
+
+    fn openat(&self, path: &CStr) -> io::Result<Self> {
+        let fd = self.fd.openat(path)?;
+        let filename = OsStr::from_bytes(path.to_bytes()).to_owned();
+
+        Ok(Open {
+            fd,
+            buffer: DirentBuf::with_size(1 << 12),
+            depth: self.depth + 1,
+            as_parent: Arc::new(Node {
+                path: EntryPath::Name {
+                    name: filename,
+                    parent: self.as_parent.clone(),
+                },
+                depth: self.depth + 1,
+            }),
+        })
+    }
+
     /// Get the next item from this directory.
     fn pop(&mut self) -> Option<Entry<'_>> {
         self.buffer.drain().next().map(Self::okay)
     }
 
     fn ready_entry(&mut self) -> Option<DirEntry> {
+        let depth = self.depth;
+        let parent = self.as_parent.clone();
         let entry = self.pop()?;
         Some(DirEntry {
             file_name: EntryPath::Name {
                 name: entry.path().to_owned(),
-                parent: self.as_parent.clone(),
+                parent,
             },
+            depth,
             file_type: FileType {
                 inner: entry.file_type(),
             },
         })
+    }
+
+    fn fill_buffer(&mut self) -> io::Result<More> {
+        self.buffer.fill_buf(self.fd.0)
     }
 
     /// Forcibly close this directory entry.
@@ -360,8 +410,7 @@ impl Open {
 
 impl DirFd {
     fn open(path: &Path) -> io::Result<Self> {
-        let mut raw_name = path.as_os_str().as_bytes().to_owned();
-        raw_name.push(b'\0');
+        let raw_name = path.as_os_str().as_bytes().to_owned();
         let unix_name = CString::new(raw_name).expect("No interior NULL byte in Path");
 
         let result = unsafe {
@@ -396,8 +445,27 @@ impl DirFd {
 }
 
 impl Closed {
-    fn from_backlog(open: &Open, backlog: Vec<Backlog>) -> Self {
-        todo!()
+    fn from_backlog(open: &Open, children: Vec<Backlog>) -> Self {
+        Closed {
+            depth: open.depth + 1,
+            children,
+            as_parent: None,
+        }
+    }
+
+    fn open(&self, backlog: &DirEntry) -> io::Result<Open> {
+        let path = backlog.file_name.path();
+        let fd = DirFd::open(&path)?;
+
+        Ok(Open {
+            fd,
+            buffer: DirentBuf::with_size(1 << 12),
+            depth: self.depth + 1,
+            as_parent: Arc::new(Node {
+                depth: self.depth + 1,
+                path: EntryPath::Full(path),
+            })
+        })
     }
 
     fn ready_entry(&mut self) -> Option<DirEntry> {
@@ -405,20 +473,96 @@ impl Closed {
         Some(DirEntry {
             file_name: EntryPath::Full(backlog.file_path),
             file_type: FileType { inner: backlog.file_type },
+            depth: self.depth,
         })
+    }
+}
+
+impl EntryPath {
+    fn path(&self) -> PathBuf {
+        match self {
+            EntryPath::Full(buf) => buf.clone(),
+            EntryPath::Name { name, parent } => {
+                let mut buf = parent.path();
+                buf.push(&name);
+                buf
+            }
+        }
     }
 }
 
 impl Node {
     /// Allocate a path buffer for the path described.
     fn path(&self) -> PathBuf {
-        if let Some(parent) = &self.parent {
-            let mut buf = parent.path();
-            buf.push(&self.filename);
-            buf
-        } else {
-            PathBuf::from(&self.filename)
+        self.path.path()
+    }
+}
+
+impl IntoIter {
+    /// See if we should descend to the newly found entry.
+    fn iter_entry(&mut self, entry: &mut DirEntry) -> Result<(), Error> {
+        let is_dir = match entry.file_type.inner {
+            Some(FileTypeInner::Directory) => true,
+            Some(_) => false,
+            None => {
+                //can we make fstatat work?
+                let meta = std::fs::metadata(entry.file_name.path())
+                    .map_err(Error::from_io)?
+                    .file_type();
+                if meta.is_dir() {
+                    entry.file_type.set(FileTypeInner::Directory);
+                    true
+                } else if meta.is_file() {
+                    entry.file_type.set(FileTypeInner::File);
+                    false
+                } else if meta.is_symlink() {
+                    entry.file_type.set(FileTypeInner::SymbolicLink);
+                    false
+                } else if meta.is_block_device() {
+                    entry.file_type.set(FileTypeInner::BlockDevice);
+                    false
+                } else if meta.is_char_device() {
+                    entry.file_type.set(FileTypeInner::CharDevice);
+                    false
+                } else if meta.is_fifo() {
+                    entry.file_type.set(FileTypeInner::File);
+                    false
+                } else if meta.is_socket() {
+                    entry.file_type.set(FileTypeInner::UnixSocket);
+                    false
+                } else {
+                    false
+                }
+            }
+        };
+
+        if is_dir {
+            // TODO: filter? min_depth? max_depth?
+
+            let can_open = self.open_budget > 0;
+            let mut next: WorkItem = match self.stack.last().unwrap() {
+                WorkItem::Open(open) if can_open => {
+                    open.openat_os(entry.file_name())
+                        .map_err(Error::from_io)
+                        .map(WorkItem::Open)?
+                }
+                WorkItem::Open(open) => {
+                    todo!()
+                }
+                WorkItem::Closed(closed) => {
+                    assert!(can_open, "No more budget but only closed work items");
+                    closed.open(entry).map_err(Error::from_io).map(WorkItem::Open)?
+                }
+            };
+
+            if !self.config.contents_first {
+                mem::swap(&mut next, self.stack.last_mut().unwrap());
+            }
+
+            self.stack.push(next);
         }
+
+        Ok({})
     }
 }
 
@@ -433,48 +577,42 @@ impl IntoIterator for WalkDir {
 impl Iterator for IntoIter {
     type Item = Result<DirEntry, Error>;
     fn next(&mut self) -> Option<Self::Item> {
-        let mut current = self.stack.pop()?;
+        let mut current = self.stack.last_mut()?;
 
         // First try to get an item that is ripe for reaping.
-        match &mut current {
+        let mut found = match &mut current {
             WorkItem::Open(open) => match open.ready_entry() {
-                Some(entry) => {
-                    // Cleanup the current.
-                    self.stack.push(current);
-                    return Some(Ok(entry))
+                Some(entry) => entry,
+                // No more items, try refilling.
+                None => {
+                    match open.fill_buffer() {
+                        Err(err) => todo!(),
+                        Ok(More::More) => return self.next(),
+                        Ok(More::Blocked) => unreachable!("Empty buffer blocked"),
+                        Ok(More::Done) => {
+                            let _ = self.stack.pop();
+                            return self.next();
+                        }
+                    }
                 },
-                None => {},
             }
             WorkItem::Closed(closed) => match closed.ready_entry() {
-                Some(entry) => {
-                    // Cleanup the current.
-                    self.stack.push(current);
-                    return Some(Ok(entry))
-                }
+                Some(entry) => entry,
                 None => {
                     // Nothing to do, try the next entry.
+                    let _ = self.stack.pop();
                     return self.next();
                 }
             }
-        }
+        };
 
-        todo!()
+        Some(self.iter_entry(&mut found).map(|_| found))
     }
 }
 
 // Private implementation items.
 
 impl Open {
-    fn openat(&self, path: &CStr) -> io::Result<Self> {
-        let fd = self.fd.openat(path)?;
-
-        Ok(Open {
-            fd,
-            buffer: DirentBuf::with_size(1 << 12),
-            depth: self.depth + 1,
-            as_parent: todo!(),
-        })
-    }
 }
 
 impl Error {
@@ -500,6 +638,10 @@ impl Error {
 
     pub fn into_io_error(&self) -> Option<std::io::Error> {
         todo!()
+    }
+
+    fn from_io(err: io::Error) -> Self {
+        Error::new()
     }
 }
 

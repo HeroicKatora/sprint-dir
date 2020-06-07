@@ -199,7 +199,14 @@ impl Dirent64 {
         let _entry_head = spec_entry
             .get(..mem::size_of::<dirent64>())
             .ok_or(DirentErr::InvalidLength)?;
-        let entry_name = spec_entry.get(mem::size_of::<dirent64>()..).unwrap();
+        let raw_entry_name = spec_entry
+            .get(mem::size_of::<dirent64>()..)
+            .unwrap();
+
+        let clen = raw_entry_name
+            .iter()
+            .position(|&b| b == b'\0')
+            .ok_or(DirentErr::InvalidLength)?;
 
         // Did all consistency checks necessary! (The null-byte check can be done later, we'll
         // check for UTF-8 as well so who cares).
@@ -209,7 +216,7 @@ impl Dirent64 {
         // entry but its slice-length meta information needs to be only the length of the name.
         let ptr = entry as *const [u8];
         // Transfer the name of the length field.
-        let raw = ptr::slice_from_raw_parts(ptr as *const u8, entry_name.len());
+        let raw = ptr::slice_from_raw_parts(ptr as *const u8, clen);
         let entry = unsafe { &*(raw as *const Dirent64) };
 
         Ok((entry, tail))
