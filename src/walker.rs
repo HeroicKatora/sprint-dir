@@ -25,7 +25,10 @@ pub struct IntoIter {
     config: Configuration,
     /// The current 'finger' within the tree of directories.
     stack: Vec<WorkItem>,
+    /// The number of file descriptors we are still allowed to open.
     open_budget: usize,
+    /// Statistics about the system calls etc.
+    stats: Stats,
 }
 
 /// Describes a file that was found.
@@ -77,6 +80,14 @@ struct Configuration {
     follow_links: bool,
     contents_first: bool,
     same_file_system: bool,
+}
+
+#[derive(Debug, Default)]
+struct Stats {
+    nr_close: usize,
+    nr_getdent: usize,
+    nr_open: usize,
+    nr_stat: usize,
 }
 
 /// Completed directory nodes that are parents of still open nodes or active entries.
@@ -190,6 +201,7 @@ impl WalkDir {
             config: self.config,
             stack: vec![WorkItem::Closed(first_item)],
             open_budget: 128,
+            stats: Stats::default(),
         }
     }
 
@@ -239,6 +251,10 @@ impl IntoIter {
         P: FnMut(&DirEntry) -> bool,
     {
         todo!()
+    }
+
+    pub fn stats(&self) -> &dyn core::fmt::Debug {
+        &self.stats
     }
 }
 
@@ -370,7 +386,7 @@ impl Open {
 
     /// Forcibly close this directory entry.
     /// Returns None if its already finished and Some with the remaining backlog items otherwise.
-    fn close(mut self) -> io::Result<Option<Closed>> {
+    fn close(mut self, stats: &mut Stats) -> io::Result<Option<Closed>> {
         let mut backlog = vec![];
         let base = self.make_path();
 
@@ -381,6 +397,7 @@ impl Open {
                 .filter_map(Self::sub_entry)
                 .map(|entry| Self::backlog(&base, entry));
             backlog.extend(entries);
+            stats.nr_getdent += 1;
             match self.buffer.fill_buf(self.fd.0)? {
                 More::Blocked => unreachable!("Just drained buffer is blocked"),
                 More::More => {},
@@ -389,10 +406,12 @@ impl Open {
         }
 
         if backlog.is_empty() {
+        stats.nr_close += 1;
             self.fd.close()?;
             Ok(None)
         } else {
             let closed = Closed::from_backlog(&self, backlog);
+            stats.nr_close += 1;
             self.fd.close()?;
             Ok(Some(closed))
         }
@@ -475,8 +494,9 @@ impl Closed {
         }
     }
 
-    fn open(&self, backlog: &DirEntry) -> io::Result<Open> {
+    fn open(&self, backlog: &DirEntry, stats: &mut Stats) -> io::Result<Open> {
         let path = backlog.file_name.path();
+        stats.nr_open += 1;
         let fd = DirFd::open(&path)?;
 
         Ok(Open {
@@ -531,6 +551,7 @@ impl IntoIter {
             Some(_) => false,
             None => {
                 //can we make fstatat work?
+                self.stats.nr_stat += 1;
                 let meta = std::fs::metadata(entry.file_name.path())
                     .map_err(Error::from_io)?
                     .file_type();
@@ -582,7 +603,9 @@ impl IntoIter {
                 }
                 WorkItem::Closed(closed) => {
                     assert!(can_open, "No more budget but only closed work items");
-                    closed.open(entry).map_err(Error::from_io).map(WorkItem::Open)?
+                    closed.open(entry, &mut self.stats)
+                        .map_err(Error::from_io)
+                        .map(WorkItem::Open)?
                 }
             };
 
@@ -616,6 +639,7 @@ impl Iterator for IntoIter {
                 Some(entry) => entry,
                 // No more items, try refilling.
                 None => {
+                    self.stats.nr_getdent += 1;
                     match open.fill_buffer() {
                         Err(err) => todo!(),
                         Ok(More::More) => return self.next(),
