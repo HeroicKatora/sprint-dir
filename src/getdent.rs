@@ -1,8 +1,15 @@
 use bytemuck::{Pod, Zeroable};
+
 use core::convert::TryFrom;
 use core::{mem, ptr};
+
 use index_ext::Int;
+
 use std::io;
+use std::ffi;
+use std::os::unix::ffi::OsStrExt;
+
+use super::UnixFileType as FileType;
 
 /// A buffer for collecting results of `getdents`.
 pub struct DirentBuf {
@@ -21,11 +28,10 @@ pub struct Entry<'buf> {
 /// A consistency error of the result buffer.
 pub enum DirentErr {
     TooShort,
-    InvalidOffset,
     InvalidLength,
 }
 
-enum More {
+pub enum More {
     More,
     Blocked,
     Done,
@@ -44,20 +50,21 @@ impl DirentBuf {
 
     pub fn iter(&self) -> Entries<'_> {
         Entries {
-            remaining: &self.inner[self.start..],
+            remaining: &self.inner[self.start..self.last],
         }
     }
 
     pub fn drain(&mut self) -> Drain<'_> {
         Drain {
             inner: Entries {
-                remaining: &self.inner[self.start..],
+                remaining: &self.inner[self.start..self.last],
             },
             start: &mut self.start,
+            last: self.last,
         }
     }
 
-    fn fill_buf(&mut self, fd: libc::c_uint) -> io::Result<More> {
+    pub fn fill_buf(&mut self, fd: libc::c_int) -> io::Result<More> {
         // Make buffer as large as possible.
         if self.start == self.last {
             self.start = 0;
@@ -100,6 +107,17 @@ pub struct Entries<'a> {
 pub struct Drain<'a> {
     inner: Entries<'a>,
     start: &'a mut usize,
+    last: usize,
+}
+
+impl Entry<'_> {
+    pub fn path(&self) -> &ffi::OsStr {
+        ffi::OsStr::from_bytes(&self.inner.d_name)
+    }
+
+    pub fn file_type(&self) -> Option<FileType> {
+        FileType::new(self.inner.d_type)
+    }
 }
 
 /// The slice into which the kernel should place dirents.
@@ -120,7 +138,7 @@ struct Dirent64 {
     /// The type indicated by the kernel, or unknown.
     d_type: libc::c_char,
     /// var length name, with the length indicated in `d_reclen`.
-    d_name: [libc::c_char],
+    d_name: [u8],
 }
 
 /// This is just an ffi descriptor type.
@@ -153,7 +171,7 @@ unsafe impl Pod for dirent64 {}
 ///   * `ENOENT` for No such directory
 ///   * `EFAULT` if the target pointer was outside our address space
 ///   * `ENOTDIR` if `fd` is not a directory
-fn sys_getdents64(fd: libc::c_uint, into: &mut DirentTarget) -> libc::c_int {
+fn sys_getdents64(fd: libc::c_int, into: &mut DirentTarget) -> libc::c_int {
     let length: libc::c_uint = libc::c_uint::try_from(into.buf.len())
         .expect("Invalid buffer length should have been checked");
     unsafe {
@@ -167,7 +185,7 @@ fn sys_getdents64(fd: libc::c_uint, into: &mut DirentTarget) -> libc::c_int {
 }
 
 impl Dirent64 {
-    pub fn from_start(buf: &[u8]) -> Result<(&Self, &[u8]), DirentErr> {
+    fn from_start(buf: &[u8]) -> Result<(&Self, &[u8]), DirentErr> {
         let speculate = buf
             .get(..mem::size_of::<dirent64>())
             .ok_or(DirentErr::TooShort)?;
@@ -180,7 +198,7 @@ impl Dirent64 {
         // Do a final consistency check.
         let _entry_head = spec_entry
             .get(..mem::size_of::<dirent64>())
-            .ok_or(DirentErr::InvalidOffset)?;
+            .ok_or(DirentErr::InvalidLength)?;
         let entry_name = spec_entry.get(mem::size_of::<dirent64>()..).unwrap();
 
         // Did all consistency checks necessary! (The null-byte check can be done later, we'll
@@ -223,6 +241,25 @@ impl<'a> Iterator for Entries<'a> {
                 self.remaining = <&'_ [u8]>::default();
                 Some(Err(err))
             }
+        }
+    }
+}
+
+impl<'a> Iterator for Drain<'a> {
+    type Item = Result<Entry<'a>, DirentErr>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.inner.next() {
+            Some(Ok(entry)) => {
+                let len = unsafe { ptr::read_unaligned(&entry.inner.d_reclen) };
+                *self.start += len as usize;
+                Some(Ok(entry))
+            }
+            Some(Err(err)) => {
+                *self.start = self.last;
+                Some(Err(err))
+            }
+            None => None,
         }
     }
 }

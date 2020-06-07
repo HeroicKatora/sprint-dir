@@ -5,6 +5,9 @@ use std::ffi::{CStr, OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::UnixFileType as FileTypeInner;
+use super::getdent::{DirentErr, Entry, More};
+
 /// Configure walking over all files in a directory tree.
 pub struct WalkDir {
     init: Open,
@@ -12,12 +15,9 @@ pub struct WalkDir {
 
 /// The main iterator.
 pub struct IntoIter {
-    /// The one directory which we are actually currently iterating over.
-    current: Option<Open>,
-    /// Directories for which we have a file descriptor open but we aren't actively iterating.
-    open: Vec<Open>,
-    /// Directories which we haven't opened yet.
-    backlog: Vec<Backlog>,
+    /// The current 'finger' within the tree of directories.
+    stack: Vec<WorkItem>,
+    open_budget: usize,
 }
 
 /// Describes a file that was found.
@@ -47,17 +47,6 @@ pub struct FileType {
     inner: Option<FileTypeInner>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum FileTypeInner {
-    BlockDevice = 1,
-    CharDevice,
-    Directory,
-    NamedPipe,
-    SymbolicLink,
-    File,
-    UnixSocket,
-}
-
 /// Completed directory nodes that are parents of still open nodes or active entries.
 #[derive(Debug)]
 struct Node {
@@ -66,6 +55,13 @@ struct Node {
     as_parent: Option<Arc<Node>>,
     /// The file name of this file itself.
     filename: OsString,
+}
+
+enum WorkItem {
+    /// A directory which is still open.
+    Open(Open),
+    /// A directory that was closed.
+    Closed(Closed),
 }
 
 /// Directories with a file descriptor.
@@ -96,7 +92,7 @@ struct Closed {
     parent: Arc<Node>,
 }
 
-/// Describes a not-yet-opened directory.
+/// Describes an item of a closed directory.
 ///
 /// The directories represented by this type are no-one's parent yet.
 ///
@@ -105,6 +101,8 @@ struct Closed {
 ///
 /// TODO: what if we use a dequeue to actually allocate these consecutively in memory?
 struct Backlog {
+    file_name: OsString,
+    file_type: Option<FileTypeInner>,
 }
 
 // Public interfaces.
@@ -123,6 +121,7 @@ impl WalkDir {
     }
 
     pub fn max_open(self, n: usize) -> Self {
+        assert!(n > 0, "");
         todo!()
     }
 
@@ -146,9 +145,8 @@ impl WalkDir {
 
     pub fn into_iter(self) -> IntoIter {
         IntoIter {
-            current: Some(self.init),
-            open: vec![],
-            backlog: vec![],
+            stack: vec![WorkItem::Open(self.init)],
+            open_budget: 128,
         }
     }
 }
@@ -216,8 +214,82 @@ impl DirEntry {
         todo!()
     }
 
+    /// The depth at which this entry is in the directory tree.
+    ///
+    /// When iterating items in depth-first order and following symbolic links then this is not
+    /// necessarily the smallest depth at which it might appear.
     pub fn depth(&self) -> usize {
         todo!()
+    }
+}
+
+impl Open {
+    /// Get the next item from this directory.
+    fn pop(&mut self) -> Option<Backlog> {
+        self.buffer.drain().next().map(Self::from_dirent)
+    }
+
+    fn ready_entry(&mut self) -> Option<DirEntry> {
+        let backlog = self.pop()?;
+        Some(DirEntry {
+            file_name: backlog.file_name,
+            file_type: FileType { inner: backlog.file_type },
+            parent: self.parent.clone(),
+        })
+    }
+
+    /// Forcibly close this directory entry.
+    /// Returns None if its already finished and Some with the remaining backlog items otherwise.
+    fn close(&mut self) -> io::Result<Option<Closed>> {
+        let mut backlog = vec![];
+        loop {
+            let entries = self.buffer
+                .drain()
+                .map(Self::from_dirent);
+            backlog.extend(entries);
+            match self.buffer.fill_buf(self.fd)? {
+                More::Blocked => unreachable!("Just drained buffer is blocked"),
+                More::More => {},
+                More::Done => break,
+            }
+        }
+
+        match unsafe { libc::close(self.fd) } {
+            0 => {},
+            _ => return Err(io::Error::last_os_error()),
+        };
+
+        if backlog.is_empty() {
+            return Ok(None)
+        }
+
+        Ok(Some(Closed::from_backlog(self, backlog)))
+    }
+
+    fn from_dirent(entry: Result<Entry<'_>, DirentErr>) -> Backlog {
+        match entry {
+            Ok(entry) => Backlog {
+                file_name: entry.path().to_owned(),
+                file_type: entry.file_type(),
+            },
+            Err(DirentErr::TooShort) => unreachable!("Inconsistent buffer state"),
+            Err(DirentErr::InvalidLength) => unreachable!("You must have hit a kernel bug!"),
+        }
+    }
+}
+
+impl Closed {
+    fn from_backlog(open: &Open, backlog: Vec<Backlog>) -> Self {
+        todo!()
+    }
+
+    fn ready_entry(&mut self) -> Option<DirEntry> {
+        let backlog = self.children.pop()?;
+        Some(DirEntry {
+            file_name: backlog.file_name,
+            file_type: FileType { inner: backlog.file_type },
+            parent: self.parent.clone(),
+        })
     }
 }
 
@@ -232,7 +304,31 @@ impl IntoIterator for WalkDir {
 impl Iterator for IntoIter {
     type Item = Result<DirEntry, Error>;
     fn next(&mut self) -> Option<Self::Item> {
-        let mut current = self.current.take()?;
+        let mut current = self.stack.pop()?;
+
+        // First try to get an item that is ripe for reaping.
+        match &mut current {
+            WorkItem::Open(open) => match open.ready_entry() {
+                Some(entry) => {
+                    // Cleanup the current.
+                    self.stack.push(current);
+                    return Some(Ok(entry))
+                },
+                None => {},
+            }
+            WorkItem::Closed(closed) => match closed.ready_entry() {
+                Some(entry) => {
+                    // Cleanup the current.
+                    self.stack.push(current);
+                    return Some(Ok(entry))
+                }
+                None => {
+                    // Nothing to do, try the next entry.
+                    return self.next();
+                }
+            }
+        }
+
         todo!()
     }
 }
