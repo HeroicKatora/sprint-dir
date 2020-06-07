@@ -10,3 +10,4 @@ bytemuck = "1.2"
 # We depend on libc for making syscalls. This is not optimal.
 libc = "0.2.71"
 index-ext = "0.0.1"
+once_cell = "1.4"

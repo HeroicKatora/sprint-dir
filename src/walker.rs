@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::ffi::OsStrExt;
+use once_cell::sync::OnceCell;
 
 use super::UnixFileType as FileTypeInner;
 use super::getdent::{DirentErr, Entry, More};
@@ -38,6 +39,8 @@ pub struct DirEntry {
     depth: usize,
     /// The file name of this entry.
     file_name: EntryPath,
+    /// The normalized full path of the entry.
+    full_path: OnceCell<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -266,7 +269,9 @@ impl DirEntry {
 
     /// Inspect the path of this entry.
     pub fn path(&self) -> &Path {
-        Path::new(self.file_name())
+        self.full_path.get_or_init(|| {
+            self.file_name.path()
+        })
     }
 
     pub fn path_is_symlink(&self) -> bool {
@@ -349,6 +354,7 @@ impl Open {
             file_type: FileType {
                 inner: entry.file_type(),
             },
+            full_path: OnceCell::new(),
         })
     }
 
@@ -472,8 +478,11 @@ impl Closed {
         let backlog = self.children.pop()?;
         Some(DirEntry {
             file_name: EntryPath::Full(backlog.file_path),
-            file_type: FileType { inner: backlog.file_type },
+            file_type: FileType {
+                inner: backlog.file_type
+            },
             depth: self.depth,
+            full_path: OnceCell::new(),
         })
     }
 }
