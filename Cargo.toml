@@ -5,6 +5,10 @@ version = "0.1.0"
 authors = ["Andreas Molzer <andreas.molzer@gmx.de>"]
 edition = "2018"
 
+[[bin]]
+name = "find"
+path = "src/bin/find.rs"
+
 [dependencies]
 bytemuck = "1.2"
 # We depend on libc for making syscalls. This is not optimal.
