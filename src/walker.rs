@@ -87,6 +87,7 @@ struct Stats {
     nr_close: usize,
     nr_getdent: usize,
     nr_open: usize,
+    nr_openat: usize,
     nr_stat: usize,
 }
 
@@ -286,7 +287,7 @@ impl DirEntry {
     /// Inspect the path of this entry.
     pub fn path(&self) -> &Path {
         self.full_path.get_or_init(|| {
-            self.file_name.path()
+            self.file_name.make_path()
         })
     }
 
@@ -296,14 +297,17 @@ impl DirEntry {
 
     /// Read the full meta data.
     pub fn metadata(&self) -> io::Result<std::fs::Metadata> {
-        std::fs::metadata(self.file_name.path())
+        std::fs::metadata(self.path())
     }
 
     /// Convert the entry into a path
     ///
     /// Potentially more efficient than `as_path().to_owned()`.
     pub fn into_path(self) -> PathBuf {
-        self.file_name.path()
+        let file_name = self.file_name;
+        self.full_path.into_inner().unwrap_or_else(|| {
+            file_name.make_path()
+        })
     }
 
     pub fn file_type(&self) -> FileType {
@@ -328,13 +332,14 @@ impl DirEntry {
 }
 
 impl Open {
-    fn openat_os(&self, path: &OsStr) -> io::Result<Self> {
+    fn openat_os(&self, path: &OsStr, stats: &mut Stats) -> io::Result<Self> {
         let bytes = path.as_bytes().to_owned();
         let cstr = CString::new(bytes).unwrap();
-        self.openat(&cstr)
+        self.openat(&cstr, stats)
     }
 
-    fn openat(&self, path: &CStr) -> io::Result<Self> {
+    fn openat(&self, path: &CStr, stats: &mut Stats) -> io::Result<Self> {
+        stats.nr_openat += 1;
         let fd = self.fd.openat(path)?;
         let filename = OsStr::from_bytes(path.to_bytes()).to_owned();
 
@@ -369,7 +374,7 @@ impl Open {
 
         Some(DirEntry {
             file_name: EntryPath::Name {
-                name: entry.path().to_owned(),
+                name: entry.file_name().to_owned(),
                 parent,
             },
             depth,
@@ -388,7 +393,7 @@ impl Open {
     /// Returns None if its already finished and Some with the remaining backlog items otherwise.
     fn close(mut self, stats: &mut Stats) -> io::Result<Option<Closed>> {
         let mut backlog = vec![];
-        let base = self.make_path();
+        let base = self.as_parent.make_path();
 
         loop {
             let entries = self.buffer
@@ -417,11 +422,6 @@ impl Open {
         }
     }
 
-    /// Reconstruct the complete path buffer.
-    fn make_path(&self) -> PathBuf {
-        self.as_parent.path()
-    }
-
     /// Filter an entry that we got from the internal buffer.
     /// Handles kernel errors and setup faults which mustn't occur in regular operation.
     fn okay(entry: Result<Entry<'_>, DirentErr>) -> Entry<'_> {
@@ -434,7 +434,7 @@ impl Open {
 
     fn sub_entry(entry: Entry<'_>) -> Option<Entry<'_>> {
         // Never recurse into current or parent directory.
-        match Path::new(entry.path()).components().next() {
+        match Path::new(entry.file_name()).components().next() {
             Some(Component::CurDir) | Some(Component::ParentDir) => None,
             _ => Some(entry),
         }
@@ -443,7 +443,7 @@ impl Open {
 
     fn backlog(base: &Path, entry: Entry<'_>) -> Backlog {
         Backlog {
-            file_path: base.join(entry.path()),
+            file_path: base.join(entry.file_name()),
             file_type: entry.file_type(),
         }
     }
@@ -495,7 +495,7 @@ impl Closed {
     }
 
     fn open(&self, backlog: &DirEntry, stats: &mut Stats) -> io::Result<Open> {
-        let path = backlog.file_name.path();
+        let path = backlog.file_name.make_path();
         stats.nr_open += 1;
         let fd = DirFd::open(&path)?;
 
@@ -524,11 +524,11 @@ impl Closed {
 }
 
 impl EntryPath {
-    fn path(&self) -> PathBuf {
+    fn make_path(&self) -> PathBuf {
         match self {
             EntryPath::Full(buf) => buf.clone(),
             EntryPath::Name { name, parent } => {
-                let mut buf = parent.path();
+                let mut buf = parent.make_path();
                 buf.push(&name);
                 buf
             }
@@ -538,8 +538,8 @@ impl EntryPath {
 
 impl Node {
     /// Allocate a path buffer for the path described.
-    fn path(&self) -> PathBuf {
-        self.path.path()
+    fn make_path(&self) -> PathBuf {
+        self.path.make_path()
     }
 }
 
@@ -552,7 +552,7 @@ impl IntoIter {
             None => {
                 //can we make fstatat work?
                 self.stats.nr_stat += 1;
-                let meta = std::fs::metadata(entry.file_name.path())
+                let meta = std::fs::metadata(entry.file_name.make_path())
                     .map_err(Error::from_io)?
                     .file_type();
                 if meta.is_dir() {
@@ -588,7 +588,7 @@ impl IntoIter {
             let can_open = self.open_budget > 0;
             let mut next: WorkItem = match self.stack.last().unwrap() {
                 WorkItem::Open(open) if can_open => {
-                    open.openat_os(entry.file_name())
+                    open.openat_os(entry.file_name(), &mut self.stats)
                         .map_err(Error::from_io)
                         .map(WorkItem::Open)?
                 }

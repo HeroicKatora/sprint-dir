@@ -111,7 +111,7 @@ pub struct Drain<'a> {
 }
 
 impl Entry<'_> {
-    pub(crate) fn path(&self) -> &ffi::OsStr {
+    pub(crate) fn file_name(&self) -> &ffi::OsStr {
         ffi::OsStr::from_bytes(&self.inner.d_name)
     }
 
