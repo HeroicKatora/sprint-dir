@@ -3,7 +3,7 @@ use crate::getdent::DirentBuf;
 use core::mem;
 use std::io;
 use std::ffi::{CStr, CString, OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::ffi::OsStrExt;
@@ -345,6 +345,12 @@ impl Open {
         let depth = self.depth;
         let parent = self.as_parent.clone();
         let entry = self.pop()?;
+
+        let entry = match Self::sub_entry(entry) {
+            None => return self.ready_entry(),
+            Some(entry) => entry,
+        };
+
         Some(DirEntry {
             file_name: EntryPath::Name {
                 name: entry.path().to_owned(),
@@ -371,6 +377,8 @@ impl Open {
         loop {
             let entries = self.buffer
                 .drain()
+                .map(Self::okay)
+                .filter_map(Self::sub_entry)
                 .map(|entry| Self::backlog(&base, entry));
             backlog.extend(entries);
             match self.buffer.fill_buf(self.fd.0)? {
@@ -405,8 +413,16 @@ impl Open {
         }
     }
 
-    fn backlog(base: &Path, entry: Result<Entry<'_>, DirentErr>) -> Backlog {
-        let entry = Self::okay(entry);
+    fn sub_entry(entry: Entry<'_>) -> Option<Entry<'_>> {
+        // Never recurse into current or parent directory.
+        match Path::new(entry.path()).components().next() {
+            Some(Component::CurDir) | Some(Component::ParentDir) => None,
+            _ => Some(entry),
+        }
+
+    }
+
+    fn backlog(base: &Path, entry: Entry<'_>) -> Backlog {
         Backlog {
             file_path: base.join(entry.path()),
             file_type: entry.file_type(),
@@ -556,6 +572,12 @@ impl IntoIter {
                         .map(WorkItem::Open)?
                 }
                 WorkItem::Open(open) => {
+                    if self.config.contents_first {
+                        // TODO: close and open the actual next.
+                    } else {
+                        // TODO: add the sub directory as a closed one.
+                    }
+
                     todo!()
                 }
                 WorkItem::Closed(closed) => {
@@ -649,7 +671,7 @@ impl Error {
         todo!()
     }
 
-    fn from_io(err: io::Error) -> Self {
+    fn from_io(_: io::Error) -> Self {
         Error::new()
     }
 }

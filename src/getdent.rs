@@ -111,18 +111,18 @@ pub struct Drain<'a> {
 }
 
 impl Entry<'_> {
-    pub fn path(&self) -> &ffi::OsStr {
+    pub(crate) fn path(&self) -> &ffi::OsStr {
         ffi::OsStr::from_bytes(&self.inner.d_name)
     }
 
-    pub fn file_type(&self) -> Option<FileType> {
+    pub(crate) fn file_type(&self) -> Option<FileType> {
         FileType::new(self.inner.d_type)
     }
 }
 
 /// The slice into which the kernel should place dirents.
 struct DirentTarget {
-    align: [dirent64; 0],
+    _align: [dirent64; 0],
     buf: [u8],
 }
 
@@ -147,6 +147,8 @@ struct Dirent64 {
 // Be careful that this struct is actually zeroable and a Pod. In particular we want to avoid
 // having any padding bytes.
 #[repr(packed)]
+// Merely a descriptor type.
+#[allow(unused)]
 #[derive(Clone, Copy)]
 struct dirent64 {
     d_ino: libc::c_ulong,
