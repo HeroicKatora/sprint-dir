@@ -2,10 +2,15 @@ use bytemuck::{Pod, Zeroable};
 use core::convert::TryFrom;
 use core::{mem, ptr};
 use index_ext::Int;
+use std::io;
 
 /// A buffer for collecting results of `getdents`.
 pub struct DirentBuf {
     inner: Box<[u8]>,
+    /// The index of the first set buffer.
+    start: usize,
+    /// The index of the first free byte.
+    last: usize,
 }
 
 /// A reference to a single entry.
@@ -20,24 +25,81 @@ pub enum DirentErr {
     InvalidLength,
 }
 
+enum More {
+    More,
+    Blocked,
+    Done,
+}
+
 impl DirentBuf {
     pub fn with_size(length: usize) -> Self {
         libc::c_uint::try_from(length).expect("Buffer size invalid for `getdent` syscall.");
 
         DirentBuf {
             inner: vec![0; length].into(),
+            start: 0,
+            last: 0,
         }
     }
 
     pub fn iter(&self) -> Entries<'_> {
         Entries {
-            remaining: &*self.inner,
+            remaining: &self.inner[self.start..],
         }
+    }
+
+    pub fn drain(&mut self) -> Drain<'_> {
+        Drain {
+            inner: Entries {
+                remaining: &self.inner[self.start..],
+            },
+            start: &mut self.start,
+        }
+    }
+
+    fn fill_buf(&mut self, fd: libc::c_uint) -> io::Result<More> {
+        // Make buffer as large as possible.
+        if self.start == self.last {
+            self.start = 0;
+            self.last = 0;
+        }
+
+        match sys_getdents64(fd, self.get_mut()) {
+            0 => Ok(More::Done),
+            -1 => {
+                match unsafe { *libc::__errno_location() } {
+                    libc::EINVAL => Ok(More::Blocked),
+                    libc::EFAULT => unreachable!("Buffer outside our memory space"),
+                    _ => Err(io::Error::last_os_error())
+                }
+            },
+            other => {
+                assert!(other > 0,
+                    "Success but negative result.");
+                assert!(self.inner[self.last..].get_int(..other).is_some(),
+                    "Success but written beyond buffer");
+                // The above assert also checks the usize conversion.
+                self.last += other as usize;
+                Ok(More::More)
+            }
+        }
+    }
+
+    fn get_mut(&mut self) -> &mut DirentTarget {
+        // TODO: wait, start position?
+        DirentTarget::new(&mut self.inner[self.last..])
     }
 }
 
+/// Iterates like entries but removes the entries.
 pub struct Entries<'a> {
     remaining: &'a [u8],
+}
+
+/// Iterates like entries but removes the entries.
+pub struct Drain<'a> {
+    inner: Entries<'a>,
+    start: &'a mut usize,
 }
 
 /// The slice into which the kernel should place dirents.
@@ -83,6 +145,14 @@ struct dirent64 {
 unsafe impl Zeroable for dirent64 {}
 unsafe impl Pod for dirent64 {}
 
+/// Return value is:
+/// * `0` if the directory is at the end.
+/// * `-1` if there was an error, the error is:
+///   * `EINVAL` signals our buffer as too short
+///   * `EBADF` if the file descriptor is invalid
+///   * `ENOENT` for No such directory
+///   * `EFAULT` if the target pointer was outside our address space
+///   * `ENOTDIR` if `fd` is not a directory
 fn sys_getdents64(fd: libc::c_uint, into: &mut DirentTarget) -> libc::c_int {
     let length: libc::c_uint = libc::c_uint::try_from(into.buf.len())
         .expect("Invalid buffer length should have been checked");
