@@ -23,11 +23,17 @@ pub struct IntoIter {
 /// Describes a file that was found.
 ///
 /// All parents of this entry have already been yielded before.
+#[derive(Debug, Clone)]
 pub struct DirEntry {
     /// The file type reported by the call to `getdent`.
     file_type: FileType,
+    /// The file name of this entry.
+    file_name: OsString,
+    /// The parent directory of the entry.
+    parent: Arc<Node>,
 }
 
+#[derive(Debug)]
 pub struct Error {
     _private: (),
 }
@@ -36,12 +42,12 @@ pub struct Error {
 ///
 /// Accessing this will not cause any system calls and is very cheap. However, the type may not
 /// always be known. In these cases you need to manually query the file meta data.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FileType {
     inner: Option<FileTypeInner>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum FileTypeInner {
     BlockDevice = 1,
     CharDevice,
@@ -53,6 +59,7 @@ enum FileTypeInner {
 }
 
 /// Completed directory nodes that are parents of still open nodes or active entries.
+#[derive(Debug)]
 struct Node {
     depth: usize,
     /// The parent of this node.
@@ -103,8 +110,38 @@ struct Backlog {
 // Public interfaces.
 
 impl WalkDir {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        unimplemented!()
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        todo!()
+    }
+
+    pub fn min_depth(self, n: usize) -> Self {
+        todo!()
+    }
+
+    pub fn max_depth(self, n: usize) -> Self {
+        todo!()
+    }
+
+    pub fn max_open(self, n: usize) -> Self {
+        todo!()
+    }
+
+    pub fn follow_links(self, yes: bool) -> Self {
+        todo!()
+    }
+
+    pub fn sort_by<F>(self, cmp: F) -> Self where
+        F: FnMut(&DirEntry, &DirEntry) -> core::cmp::Ordering + Send + Sync + 'static,
+    {
+        todo!()
+    }
+
+    pub fn contents_first(self, yes: bool) -> Self {
+        todo!()
+    }
+
+    pub fn same_file_system(self, yes: bool) -> Self {
+        todo!()
     }
 
     pub fn into_iter(self) -> IntoIter {
@@ -116,36 +153,87 @@ impl WalkDir {
     }
 }
 
+impl IntoIter {
+    pub fn skip_current_dir(&mut self) {
+        todo!()
+    }
+
+    pub fn filter_entry<P>(self, predicate: P) -> FilterEntry<Self, P> where
+        P: FnMut(&DirEntry) -> bool,
+    {
+        todo!()
+    }
+}
+
+pub struct FilterEntry<I, P> {
+    unused: core::marker::PhantomData<(I, P)>,
+}
+
+impl FileType {
+    pub fn is_dir(&self) -> bool {
+        self.inner == Some(FileTypeInner::Directory)
+    }
+
+    pub fn is_file(&self) -> bool {
+        self.inner == Some(FileTypeInner::File)
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.inner == Some(FileTypeInner::SymbolicLink)
+    }
+}
+
 impl DirEntry {
     // TODO: enable `openat`?
 
     /// Inspect the path of this entry.
-    pub fn as_path(&self) -> &Path {
-        unimplemented!()
+    pub fn path(&self) -> &Path {
+        todo!()
+    }
+
+    pub fn path_is_symlink(&self) -> bool {
+        todo!()
+    }
+
+    /// Read the full meta data.
+    pub fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        todo!()
     }
 
     /// Convert the entry into a path
     ///
     /// Potentially more efficient than `as_path().to_owned()`.
     pub fn into_path(self) -> PathBuf {
-        unimplemented!()
+        todo!()
     }
 
     pub fn file_type(&self) -> FileType {
-        unimplemented!()
+        todo!()
     }
 
     /// Return the filename of this entry.
     pub fn file_name(&self) -> &OsStr {
-        unimplemented!()
+        todo!()
+    }
+
+    pub fn depth(&self) -> usize {
+        todo!()
     }
 }
 
-impl Iterator for WalkDir {
+impl IntoIterator for WalkDir {
+    type IntoIter = IntoIter;
+    type Item = Result<DirEntry, Error>;
+    fn into_iter(self) -> IntoIter {
+        WalkDir::into_iter(self)
+    }
+}
+
+impl Iterator for IntoIter {
     type Item = Result<DirEntry, Error>;
     fn next(&mut self) -> Option<Self::Item> {
         let mut current = self.current.take()?;
-        unimplemented!()
+        todo!()
     }
 }
 
@@ -169,5 +257,32 @@ impl Open {
 impl Error {
     fn new() -> Self {
         Error { _private: () }
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        todo!()
+    }
+
+    pub fn loop_ancestor(&self) -> Option<&Path> {
+        todo!()
+    }
+
+    pub fn depth(&self) -> usize {
+        todo!()
+    }
+
+    pub fn io_error(&self) -> Option<&std::io::Error> {
+        todo!()
+    }
+
+    pub fn into_io_error(&self) -> Option<std::io::Error> {
+        todo!()
+    }
+}
+
+impl<P> Iterator for FilterEntry<IntoIter, P> {
+    type Item = Result<DirEntry, Error>;
+    fn next(&mut self) -> Option<Self::Item> {
+        unimplemented!()
     }
 }

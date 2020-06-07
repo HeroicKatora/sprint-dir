@@ -1,4 +1,6 @@
 mod getdent;
 mod walker;
+#[cfg(test)]
+mod tests;
 
-pub use walker::WalkDir;
+pub use walker::{DirEntry, Error, FilterEntry, IntoIter, WalkDir};
