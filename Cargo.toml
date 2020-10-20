@@ -1,7 +1,7 @@
 [package]
 name = "sprint-dir"
 description = "Walk directory trees, really really fast"
-version = "0.1.0"
+version = "0.0.1"
 authors = ["Andreas Molzer <andreas.molzer@gmx.de>"]
 edition = "2018"
 
@@ -16,4 +16,6 @@ libc = "0.2.71"
 index-ext = "0.0.1"
 once_cell = "1.4"
 
-walkdir = "2.1"
+# Only for comparison.
+[dev-dependencies.walkdir]
+version = "2.1"
