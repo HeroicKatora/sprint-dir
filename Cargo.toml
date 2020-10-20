@@ -1,7 +1,9 @@
 [package]
 name = "sprint-dir"
 description = "Walk directory trees, really really fast"
+repository = "https://github.com/HeroicKatora/sprint-dir"
 version = "0.0.1"
+license = "WTFPL"
 authors = ["Andreas Molzer <andreas.molzer@gmx.de>"]
 edition = "2018"
 
