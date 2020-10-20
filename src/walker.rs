@@ -196,6 +196,7 @@ impl WalkDir {
     }
 
     pub fn build(mut self) -> IntoIter {
+        self.config.assert_consistent();
         let first_item = self.initial_closed();
 
         IntoIter {
@@ -345,7 +346,7 @@ impl Open {
 
         Ok(Open {
             fd,
-            buffer: DirentBuf::with_size(1 << 12),
+            buffer: DirentBuf::with_size(1 << 14),
             depth: self.depth + 1,
             as_parent: Arc::new(Node {
                 path: EntryPath::Name {
@@ -385,7 +386,8 @@ impl Open {
         })
     }
 
-    fn fill_buffer(&mut self) -> io::Result<More> {
+    fn fill_buffer(&mut self, stats: &mut Stats) -> io::Result<More> {
+        stats.nr_getdent += 1;
         self.buffer.fill_buf(self.fd.0)
     }
 
@@ -411,7 +413,7 @@ impl Open {
         }
 
         if backlog.is_empty() {
-        stats.nr_close += 1;
+            stats.nr_close += 1;
             self.fd.close()?;
             Ok(None)
         } else {
@@ -501,7 +503,7 @@ impl Closed {
 
         Ok(Open {
             fd,
-            buffer: DirentBuf::with_size(1 << 12),
+            buffer: DirentBuf::with_size(1 << 14),
             depth: self.depth + 1,
             as_parent: Arc::new(Node {
                 depth: self.depth + 1,
@@ -639,8 +641,7 @@ impl Iterator for IntoIter {
                 Some(entry) => entry,
                 // No more items, try refilling.
                 None => {
-                    self.stats.nr_getdent += 1;
-                    match open.fill_buffer() {
+                    match open.fill_buffer(&mut self.stats) {
                         Err(err) => todo!(),
                         Ok(More::More) => return self.next(),
                         Ok(More::Blocked) => unreachable!("Empty buffer blocked"),
